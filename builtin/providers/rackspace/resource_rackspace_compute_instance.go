@@ -20,6 +20,7 @@ import (
 	"github.com/rackspace/gophercloud/pagination"
 	rsFlavors "github.com/rackspace/gophercloud/rackspace/compute/v2/flavors"
 	rsImages "github.com/rackspace/gophercloud/rackspace/compute/v2/images"
+	rsComputeNetworks "github.com/rackspace/gophercloud/rackspace/compute/v2/networks"
 	rsServers "github.com/rackspace/gophercloud/rackspace/compute/v2/servers"
 	rsVolumeAttach "github.com/rackspace/gophercloud/rackspace/compute/v2/volumeattach"
 	rsNetworks "github.com/rackspace/gophercloud/rackspace/networking/v2/networks"
@@ -82,14 +83,31 @@ func resourceComputeInstance() *schema.Resource {
 						"uuid": &schema.Schema{
 							Type:     schema.TypeString,
 							Optional: true,
+							Computed: true,
+						},
+						"name": &schema.Schema{
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
 						},
 						"port": &schema.Schema{
 							Type:     schema.TypeString,
 							Optional: true,
+							Computed: true,
 						},
-						"fixed_ip": &schema.Schema{
+						"fixed_ip_v4": &schema.Schema{
 							Type:     schema.TypeString,
 							Optional: true,
+							Computed: true,
+						},
+						"fixed_ip_v6": &schema.Schema{
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+						"mac": &schema.Schema{
+							Type:     schema.TypeString,
+							Computed: true,
 						},
 					},
 				},
@@ -193,6 +211,11 @@ func resourceComputeInstanceCreate(d *schema.ResourceData, meta interface{}) err
 		return fmt.Errorf("Error creating Rackspace compute client: %s", err)
 	}
 
+	networkingClient, err := config.networkingClient(d.Get("region").(string))
+	if err != nil {
+		return fmt.Errorf("Error creating Rackspace networking client: %s", err)
+	}
+
 	imageID, err := getImageID(computeClient, d)
 	if err != nil {
 		return err
@@ -203,17 +226,50 @@ func resourceComputeInstanceCreate(d *schema.ResourceData, meta interface{}) err
 		return err
 	}
 
+	blockDevices := []osBootfromvolume.BlockDevice{}
+	if vL, ok := d.GetOk("block_device"); ok {
+		for _, v := range vL.([]interface{}) {
+			if v == nil {
+				continue
+			}
+
+			blockDeviceRaw := v.(map[string]interface{})
+
+			// Allow empty/blank block_devices
+			if blockDeviceRaw["uuid"] == "" && blockDeviceRaw["source_type"] == "" {
+				continue
+			}
+
+			blockDevice := resourceInstanceBlockDevice(d, blockDeviceRaw)
+			blockDevices = append(blockDevices, blockDevice)
+		}
+	}
+
+	networkDetails, err := resourceInstanceNetworks(computeClient, networkingClient, d)
+	if err != nil {
+		return err
+	}
+
+	networks := make([]osServers.Network, len(networkDetails))
+	for i, net := range networkDetails {
+		networks[i] = osServers.Network{
+			UUID:    net["uuid"].(string),
+			Port:    net["port"].(string),
+			FixedIP: net["fixed_ip_v4"].(string),
+		}
+	}
+
 	createOpts := &rsServers.CreateOpts{
 		Name:           d.Get("name").(string),
 		ImageRef:       imageID,
 		FlavorRef:      flavorID,
-		Networks:       resourceInstanceNetworks(d),
+		Networks:       networks,
 		Metadata:       resourceInstanceMetadata(d),
 		SecurityGroups: resourceInstanceSecGroups(d),
 		ConfigDrive:    d.Get("config_drive").(bool),
 		AdminPass:      d.Get("admin_pass").(string),
 		KeyPair:        d.Get("keypair").(string),
-		BlockDevice:    resourceInstanceBlockDevice(d),
+		BlockDevice:    blockDevices,
 	}
 
 	log.Printf("[INFO] Requesting instance creation")
@@ -272,6 +328,11 @@ func resourceComputeInstanceRead(d *schema.ResourceData, meta interface{}) error
 		return fmt.Errorf("Error creating Rackspace compute client: %s", err)
 	}
 
+	networkingClient, err := config.networkingClient(d.Get("region").(string))
+	if err != nil {
+		return fmt.Errorf("Error creating Rackspace networking client: %s", err)
+	}
+
 	server, err := rsServers.Get(computeClient, d.Id()).Extract()
 	if err != nil {
 		return CheckDeleted(d, err, "server")
@@ -281,67 +342,85 @@ func resourceComputeInstanceRead(d *schema.ResourceData, meta interface{}) error
 
 	d.Set("region", d.Get("region").(string))
 	d.Set("name", server.Name)
+
+	// begin reading the network configuration
 	d.Set("access_ip_v4", server.AccessIPv4)
 	d.Set("access_ip_v6", server.AccessIPv6)
-
 	hostv4 := server.AccessIPv4
-	if hostv4 == "" {
-		if publicAddressesRaw, ok := server.Addresses["public"]; ok {
-			publicAddresses := publicAddressesRaw.([]interface{})
-			for _, paRaw := range publicAddresses {
-				pa := paRaw.(map[string]interface{})
-				if pa["version"].(float64) == 4 {
-					hostv4 = pa["addr"].(string)
-					break
-				}
-			}
-		}
-	}
-
-	// If no host found, just get the first IPv4 we find
-	if hostv4 == "" {
-		for _, networkAddresses := range server.Addresses {
-			for _, element := range networkAddresses.([]interface{}) {
-				address := element.(map[string]interface{})
-				if address["version"].(float64) == 4 {
-					hostv4 = address["addr"].(string)
-					break
-				}
-			}
-		}
-	}
-	d.Set("access_ip_v4", hostv4)
-	log.Printf("hostv4: %s", hostv4)
-
 	hostv6 := server.AccessIPv6
-	if hostv6 == "" {
-		if publicAddressesRaw, ok := server.Addresses["public"]; ok {
-			publicAddresses := publicAddressesRaw.([]interface{})
-			for _, paRaw := range publicAddresses {
-				pa := paRaw.(map[string]interface{})
-				if pa["version"].(float64) == 4 {
-					hostv6 = fmt.Sprintf("[%s]", pa["addr"].(string))
-					break
+
+	networkDetails, err := resourceInstanceNetworks(computeClient, networkingClient, d)
+	addresses := resourceInstanceAddresses(server.Addresses)
+	if err != nil {
+		return err
+	}
+
+	// if there are no networkDetails, make networks at least a length of 1
+	networkLength := 1
+	if len(networkDetails) > 0 {
+		networkLength = len(networkDetails)
+	}
+	networks := make([]map[string]interface{}, networkLength)
+
+	// Loop through all networks and addresses,
+	// merge relevant address details.
+	if len(networkDetails) == 0 {
+		for netName, n := range addresses {
+			if floatingIP, ok := n["floating_ip"]; ok {
+				hostv4 = floatingIP.(string)
+			} else {
+				if hostv4 == "" && n["fixed_ip_v4"] != nil {
+					hostv4 = n["fixed_ip_v4"].(string)
 				}
+			}
+
+			if hostv6 == "" && n["fixed_ip_v6"] != nil {
+				hostv6 = n["fixed_ip_v6"].(string)
+			}
+
+			networks[0] = map[string]interface{}{
+				"name":        netName,
+				"fixed_ip_v4": n["fixed_ip_v4"],
+				"fixed_ip_v6": n["fixed_ip_v6"],
+				"mac":         n["mac"],
+			}
+		}
+	} else {
+		for i, net := range networkDetails {
+			n := addresses[net["name"].(string)]
+
+			if floatingIP, ok := n["floating_ip"]; ok {
+				hostv4 = floatingIP.(string)
+			} else {
+				if hostv4 == "" && n["fixed_ip_v4"] != nil {
+					hostv4 = n["fixed_ip_v4"].(string)
+				}
+			}
+
+			if hostv6 == "" && n["fixed_ip_v6"] != nil {
+				hostv6 = n["fixed_ip_v6"].(string)
+			}
+
+			networks[i] = map[string]interface{}{
+				"uuid":        networkDetails[i]["uuid"],
+				"name":        networkDetails[i]["name"],
+				"port":        networkDetails[i]["port"],
+				"fixed_ip_v4": n["fixed_ip_v4"],
+				"fixed_ip_v6": n["fixed_ip_v6"],
+				"mac":         n["mac"],
 			}
 		}
 	}
 
-	// If no hostv6 found, just get the first IPv6 we find
-	if hostv6 == "" {
-		for _, networkAddresses := range server.Addresses {
-			for _, element := range networkAddresses.([]interface{}) {
-				address := element.(map[string]interface{})
-				if address["version"].(float64) == 6 {
-					hostv6 = fmt.Sprintf("[%s]", address["addr"].(string))
-					break
-				}
-			}
-		}
-	}
+	log.Printf("[DEBUG] new networks: %+v", networks)
+
+	d.Set("network", networks)
+	d.Set("access_ip_v4", hostv4)
 	d.Set("access_ip_v6", hostv6)
+	log.Printf("hostv4: %s", hostv4)
 	log.Printf("hostv6: %s", hostv6)
 
+	// prefer the v6 address if no v4 address exists.
 	preferredv := ""
 	if hostv4 != "" {
 		preferredv = hostv4
@@ -356,6 +435,7 @@ func resourceComputeInstanceRead(d *schema.ResourceData, meta interface{}) error
 			"host": preferredv,
 		})
 	}
+	// end network configuration
 
 	d.Set("metadata", server.Metadata)
 
@@ -603,18 +683,94 @@ func resourceInstanceSecGroups(d *schema.ResourceData) []string {
 	return secgroups
 }
 
-func resourceInstanceNetworks(d *schema.ResourceData) []osServers.Network {
+func resourceInstanceNetworks(computeClient *gophercloud.ServiceClient, networkingClient *gophercloud.ServiceClient, d *schema.ResourceData) ([]map[string]interface{}, error) {
 	rawNetworks := d.Get("network").([]interface{})
-	networks := make([]osServers.Network, len(rawNetworks))
-	for i, raw := range rawNetworks {
+	newNetworks := make([]map[string]interface{}, 0, len(rawNetworks))
+
+	for _, raw := range rawNetworks {
+		// Not sure what causes this, but it is a possibility (see GH-2323).
+		// Since we call this function to reconcile what we'll save in the
+		// state anyways, we just ignore it.
+		if raw == nil {
+			continue
+		}
+
 		rawMap := raw.(map[string]interface{})
-		networks[i] = osServers.Network{
-			UUID:    rawMap["uuid"].(string),
-			Port:    rawMap["port"].(string),
-			FixedIP: rawMap["fixed_ip"].(string),
+		name := rawMap["name"]
+		uuid := rawMap["uuid"]
+		port := rawMap["port"]
+
+		networkID := ""
+		networkName := ""
+
+		if uuid == "" && port != "" {
+			portResult, err := rsPorts.Get(networkingClient, port.(string)).Extract()
+			if err != nil {
+				return nil, err
+			}
+
+			uuid = portResult.NetworkID
+		}
+
+		// Cannot use .Get, even if we have a UUID, because non-user-owned networks,
+		// like PublicNet, are only available in the List
+		allPages, err := rsComputeNetworks.List(computeClient).AllPages()
+		if err != nil {
+			_, ok := err.(*gophercloud.UnexpectedResponseCodeError)
+			if !ok {
+				return nil, err
+			}
+		}
+
+		networkList, err := rsComputeNetworks.ExtractNetworks(allPages)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, network := range networkList {
+			if network.Label == name || network.ID == uuid {
+				networkID = network.ID
+				networkName = network.Label
+				break
+			}
+		}
+
+		newNetworks = append(newNetworks, map[string]interface{}{
+			"uuid":        networkID,
+			"name":        networkName,
+			"port":        rawMap["port"].(string),
+			"fixed_ip_v4": rawMap["fixed_ip_v4"].(string),
+		})
+	}
+
+	log.Printf("[DEBUG] networks: %+v", newNetworks)
+	return newNetworks, nil
+}
+
+func resourceInstanceAddresses(addresses map[string]interface{}) map[string]map[string]interface{} {
+	addrs := make(map[string]map[string]interface{})
+	for n, networkAddresses := range addresses {
+		addrs[n] = make(map[string]interface{})
+		for _, element := range networkAddresses.([]interface{}) {
+			address := element.(map[string]interface{})
+			if address["OS-EXT-IPS:type"] == "floating" {
+				addrs[n]["floating_ip"] = address["addr"]
+			} else {
+				if address["version"].(float64) == 4 {
+					addrs[n]["fixed_ip_v4"] = address["addr"].(string)
+				} else {
+					addrs[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
+				}
+			}
+			if mac, ok := address["OS-EXT-IPS-MAC:mac_addr"]; ok {
+				addrs[n]["mac"] = mac.(string)
+			}
 		}
 	}
-	return networks
+
+	log.Printf("[DEBUG] Addresses: %+v", addresses)
+
+	return addrs
 }
 
 func resourceInstanceMetadata(d *schema.ResourceData) map[string]string {
@@ -625,20 +781,18 @@ func resourceInstanceMetadata(d *schema.ResourceData) map[string]string {
 	return m
 }
 
-func resourceInstanceBlockDevice(d *schema.ResourceData) []osBootfromvolume.BlockDevice {
-	bd := d.Get("block_device").(map[string]interface{})
+func resourceInstanceBlockDevice(d *schema.ResourceData, bd map[string]interface{}) osBootfromvolume.BlockDevice {
 	sourceType := osBootfromvolume.SourceType(bd["source_type"].(string))
-	bfvOpts := []osBootfromvolume.BlockDevice{
-		osBootfromvolume.BlockDevice{
-			UUID:            bd["uuid"].(string),
-			SourceType:      sourceType,
-			VolumeSize:      bd["volume_size"].(int),
-			DestinationType: bd["destination_type"].(string),
-			BootIndex:       bd["boot_index"].(int),
-		},
+	bfvOpt := osBootfromvolume.BlockDevice{
+		UUID:                bd["uuid"].(string),
+		SourceType:          sourceType,
+		VolumeSize:          bd["volume_size"].(int),
+		DestinationType:     bd["destination_type"].(string),
+		BootIndex:           bd["boot_index"].(int),
+		DeleteOnTermination: bd["delete_on_termination"].(bool),
 	}
 
-	return bfvOpts
+	return bfvOpt
 }
 
 func getFirstNetworkID(networkingClient *gophercloud.ServiceClient, instanceID string) (string, error) {

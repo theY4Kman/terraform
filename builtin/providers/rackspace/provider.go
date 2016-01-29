@@ -34,7 +34,14 @@ func Provider() terraform.ResourceProvider {
 		},
 
 		ResourcesMap: map[string]*schema.Resource{
-			"rackspace_compute_instance": resourceComputeInstance(),
+			"rackspace_blockstorage_volume":     resourceBlockStorageVolume(),
+			"rackspace_compute_instance":        resourceComputeInstance(),
+			"rackspace_compute_keypair":         resourceComputeKeypair(),
+			"rackspace_networking_network":      resourceNetworkingNetwork(),
+			"rackspace_networking_port":         resourceNetworkingPort(),
+			"rackspace_networking_secgroup":     resourceNetworkingSecGroup(),
+			"rackspace_networking_secgrouprule": resourceNetworkingSecGroupRule(),
+			"rackspace_networking_subnet":       resourceNetworkingSubnet(),
 		},
 
 		ConfigureFunc: configureProvider,
@@ -63,5 +70,12 @@ func envDefaultFunc(k string) schema.SchemaDefaultFunc {
 		}
 
 		return nil, nil
+	}
+}
+
+func envDefaultFuncAllowMissing(k string) schema.SchemaDefaultFunc {
+	return func() (interface{}, error) {
+		v := os.Getenv(k)
+		return v, nil
 	}
 }
