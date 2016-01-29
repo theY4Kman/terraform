@@ -1,4 +1,4 @@
-TEST?=./...
+TEST?=$$(GO15VENDOREXPERIMENT=1 go list ./... | grep -v /vendor/)
 VETARGS?=-asmdecl -atomic -bool -buildtags -copylocks -methods -nilfunc -printf -rangeloops -shift -structtags -unsafeptr
 
 default: test
@@ -65,8 +65,8 @@ cover:
 	@go tool cover 2>/dev/null; if [ $$? -eq 3 ]; then \
 		go get -u golang.org/x/tools/cmd/cover; \
 	fi
-	go test $(TEST) -coverprofile=coverage.out
-	go tool cover -html=coverage.out
+	GO15VENDOREXPERIMENT=1 go test $(TEST) -coverprofile=coverage.out
+	GO15VENDOREXPERIMENT=1 go tool cover -html=coverage.out
 	rm coverage.out
 
 # vet runs the Go source code static analysis tool `vet` to find
@@ -76,7 +76,7 @@ vet:
 		go get golang.org/x/tools/cmd/vet; \
 	fi
 	@echo "go tool vet $(VETARGS) ."
-	@go tool vet $(VETARGS) . ; if [ $$? -eq 1 ]; then \
+	@GO15VENDOREXPERIMENT=1 go tool vet $(VETARGS) $$(GO15VENDOREXPERIMENT=1 go list ./... | grep -v /vendor/). ; if [ $$? -eq 1 ]; then \
 		echo ""; \
 		echo "Vet found suspicious constructs. Please check the reported constructs"; \
 		echo "and fix them if necessary before submitting the code for review."; \
@@ -86,7 +86,7 @@ vet:
 # generate runs `go generate` to build the dynamically generated
 # source files.
 generate:
-	go generate ./...
+	GO15VENDOREXPERIMENT=1 go generate $$(GO15VENDOREXPERIMENT=1 go list ./... | grep -v /vendor/)
 
 fmt:
 	gofmt -w .
